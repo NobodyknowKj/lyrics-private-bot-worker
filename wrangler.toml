@@ -1,0 +1,6 @@
+name = "lyrics-private-bot"
+main = "worker.js"
+compatibility_date = "2025-03-01"
+# KV binding is added in the Cloudflare dashboard after import:
+# create a KV namespace and bind it as LYRICS_KV.
+# Secrets TELEGRAM_BOT_TOKEN and WEBHOOK_SECRET are also set in the dashboard, never in this repo.
