@@ -26,8 +26,20 @@
 // Deploy (dashboard, no computer needed): paste this file into a new
 // Worker, bind a KV namespace as LYRICS_KV, add the secrets, deploy,
 // then set the Telegram webhook to https://<worker>/webhook (README).
+//
+// v1.0.3-worker changes (translation reliability on shared datacenter
+// IPs): Google and MyMemory translation calls are retried once with a
+// backoff after a failure, so a transient 429/5xx no longer kills a
+// whole song; a failed translation now reports WHICH service failed,
+// with which HTTP status, and on which lyric line, both in the stored
+// job error and in the user's Telegram message — so the next failure
+// is self-diagnosing and no Cloudflare log hunt is needed; lines that
+// contain no letters or digits (e.g. "...", "—") are kept as-is
+// instead of being sent to a translator that may reject them; and an
+// optional MYMEMORY_EMAIL secret (your own email address, not a token)
+// raises the MyMemory quota above the shared anonymous IP quota.
 
-export const VERSION = "1.0.2-worker";
+export const VERSION = "1.0.3-worker";
 export const MAX_QUEUE_PER_USER = 10;
 export const TEXT_CHUNK_LIMIT = 4000;
 const AUDIO_EXTS = [".mp3", ".m4a", ".flac", ".wav", ".ogg", ".opus", ".aac"];
@@ -458,11 +470,12 @@ export function detectSourceLang(lines) {
   return "en";
 }
 
-async function translateOneMyMemory(text, sourceLang = "en") {
+async function translateOneMyMemory(text, sourceLang = "en", mymemoryEmail = null) {
   const src = (sourceLang || "en").trim().toLowerCase();
   const safeSrc = src === "auto" || !src ? "en" : src;
+  const emailParam = mymemoryEmail ? `&de=${encodeURIComponent(mymemoryEmail)}` : "";
   const data = await httpGetJson(
-    `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(`${safeSrc}|fa`)}`);
+    `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(`${safeSrc}|fa`)}${emailParam}`);
   if (String(data.responseStatus) !== "200") {
     throw new TranslationFailed(`MyMemory failed: status ${data.responseStatus}`);
   }
@@ -474,7 +487,30 @@ async function translateOneMyMemory(text, sourceLang = "en") {
   return out;
 }
 
-export async function translateLines(lines) {
+// Lines with no letter or digit (punctuation, dashes, "...") are not
+// translated at all: translators may return empty text for them, which
+// previously turned a whole song into a TranslationFailed.
+export function isNonTranslatableLine(line) {
+  return !/[\p{L}\p{N}]/u.test(line || "");
+}
+
+function truncateForError(text, max = 80) {
+  const s = String(text ?? "");
+  return s.length > max ? s.slice(0, max) + "…" : s;
+}
+
+// Try fn, wait `delayMs`, try once more. Returns the result, or throws
+// the LAST error so the caller reports the most recent failure.
+async function withOneRetry(fn, delayMs = 1000) {
+  try {
+    return await fn();
+  } catch (firstErr) {
+    await sleep(delayMs);
+    return await fn();
+  }
+}
+
+export async function translateLines(lines, opts = {}) {
   if (!lines || !lines.length) return [];
   const sourceLang = detectSourceLang(lines);
   if (sourceLang === "fa") return [...lines];
@@ -483,30 +519,38 @@ export async function translateLines(lines) {
     const chunk = lines.slice(start, start + 20);
     let batched = false;
     try {
-      const batch = await translateOneGoogle(chunk.join("\n"));
+      const batch = await withOneRetry(() => translateOneGoogle(chunk.join("\n")), 1000);
       const batchLines = batch.split("\n").map((l) => l.trim()).filter(Boolean);
       if (batchLines.length === chunk.length) { out.push(...batchLines); batched = true; }
     } catch { /* fall through to line-by-line */ }
     if (batched) continue;
     for (const line of chunk) {
-      try {
-        out.push(await translateOneGoogle(line));
-      } catch {
-        try {
-          out.push(await translateOneMyMemory(line, sourceLang));
-        } catch (err) {
-          throw new TranslationFailed(`Translation failed for line: ${line}`);
+      if (isNonTranslatableLine(line)) { out.push(line); continue; }
+      let fa = null;
+      let googleErr = null;
+      try { fa = await withOneRetry(() => translateOneGoogle(line), 800); }
+      catch (err) { googleErr = err; }
+      if (fa === null) {
+        let mymemoryErr = null;
+        try { fa = await withOneRetry(() => translateOneMyMemory(line, sourceLang, opts.mymemoryEmail), 800); }
+        catch (err) { mymemoryErr = err; }
+        if (fa === null) {
+          throw new TranslationFailed(
+            `Translation failed for line: ${truncateForError(line)} ` +
+            `(Google: ${truncateForError(googleErr && googleErr.message)}; ` +
+            `MyMemory: ${truncateForError(mymemoryErr && mymemoryErr.message)})`);
         }
       }
+      out.push(fa);
       await sleep(150);
     }
   }
   return out;
 }
 
-export async function makePairsFromLines(lines) {
+export async function makePairsFromLines(lines, opts = {}) {
   const lang = detectSourceLang(lines);
-  const persian = await translateLines(lines);
+  const persian = await translateLines(lines, opts);
   return { pairs: lines.map((line, i) => [line, persian[i]]), lang };
 }
 
@@ -735,7 +779,7 @@ async function askLyricsFallback(tg, job, reason = null) {
     });
 }
 
-export async function processJob(kv, tg, doc, job, userId) {
+export async function processJob(kv, tg, doc, job, userId, env = {}) {
   job.status = "processing";
   job.updatedAt = nowIso();
   await saveUserDoc(kv, userId, doc);
@@ -744,7 +788,7 @@ export async function processJob(kv, tg, doc, job, userId) {
     if (job.providedLyrics) lines = job.providedLyrics;
     else if (job.lyricsUrl) lines = await extractLyricsFromUrl(job.lyricsUrl);
     else lines = await searchLyrics(job.artist, job.title);
-    const { pairs, lang } = await makePairsFromLines(lines);
+    const { pairs, lang } = await makePairsFromLines(lines, { mymemoryEmail: env.MYMEMORY_EMAIL || null });
     job.status = "done";
     job.resultPairs = pairs;
     job.updatedAt = nowIso();
@@ -773,14 +817,15 @@ export async function processJob(kv, tg, doc, job, userId) {
     job.updatedAt = nowIso();
     await saveUserDoc(kv, userId, doc);
     if (err instanceof TranslationFailed) {
-      await tg.sendMessage(job.chatId, `⚠️ ترجمه برای ${songHeader(job.artist, job.title)} انجام نشد. دوباره تلاش کن یا /queue را ببین.`);
+      const detail = truncateForError(job.error, 300);
+      await tg.sendMessage(job.chatId, `⚠️ ترجمه برای ${songHeader(job.artist, job.title)} انجام نشد.\nعلت: ${detail}\nدوباره تلاش کن یا /queue را ببین.`);
     } else {
       await tg.sendMessage(job.chatId, `⚠️ خطایی برای ${songHeader(job.artist, job.title)} پیش آمد: ${job.error}`);
     }
   }
 }
 
-export async function processQueue(kv, tg, userId) {
+export async function processQueue(kv, tg, userId, env = {}) {
   let doc = await loadUserDoc(kv, userId);
   if (doc.processingJobId) {
     const age = doc.processingAt ? Date.now() - doc.processingAt : Infinity;
@@ -806,7 +851,7 @@ export async function processQueue(kv, tg, userId) {
     doc.processingAt = Date.now();
     await saveUserDoc(kv, userId, doc);
     try {
-      await processJob(kv, tg, doc, job, userId);
+      await processJob(kv, tg, doc, job, userId, env);
     } catch (err) {
       // processJob handles its own errors; this is only a last resort
       // so one bad job never blocks the rest of the queue.
@@ -918,7 +963,7 @@ export async function handleUpdate(env, update, tg, kv, schedule) {
       const modeFa = job.outputMode === "telegraph" ? "تلگراف 📜" : "پیام متنی 💬";
       await edit(`انتخاب شد: ${modeFa}\n${songHeader(job.artist, job.title)}`);
       if (await enqueueOrTell(kv, tg, doc, job, user.id)) {
-        runInBackground(processQueue(kv, tg, user.id));
+        runInBackground(processQueue(kv, tg, user.id, env));
       }
       return;
     }
@@ -955,7 +1000,7 @@ export async function handleUpdate(env, update, tg, kv, schedule) {
       await saveUserDoc(kv, user.id, doc);
       await edit(`متن دریافت شد (${lines.length} خط). ✅\n${songHeader(job.artist, job.title)}\nدر حال ترجمه…`);
       if (await enqueueOrTell(kv, tg, doc, job, user.id, true)) {
-        runInBackground(processQueue(kv, tg, user.id));
+        runInBackground(processQueue(kv, tg, user.id, env));
       }
       return;
     }
@@ -1130,14 +1175,14 @@ export async function handleUpdate(env, update, tg, kv, schedule) {
     await saveUserDoc(kv, user.id, doc);
     await tg.sendMessage(chatId, "لینک دریافت شد. 🔗\nمتن را از همان صفحه برمی‌دارم و بعد ترجمه می‌کنم.");
     if (await enqueueOrTell(kv, tg, doc, job, user.id, true)) {
-      runInBackground(processQueue(kv, tg, user.id));
+      runInBackground(processQueue(kv, tg, user.id, env));
     }
     return;
   }
 
   // Stale-processing recovery on any new message from this user.
   if (doc.processingJobId && doc.processingAt && Date.now() - doc.processingAt >= STALE_PROCESSING_MS) {
-    runInBackground(processQueue(kv, tg, user.id));
+    runInBackground(processQueue(kv, tg, user.id, env));
   }
 
   // Plain text that looks like a song name: treat as manual entry.
@@ -1208,7 +1253,7 @@ export default {
         const stale = doc.processingJobId && doc.processingAt && Date.now() - doc.processingAt >= STALE_PROCESSING_MS;
         const queuedIdle = doc.queue.length > 0 && !doc.processingJobId;
         if (stale || queuedIdle) {
-          await processQueue(env.LYRICS_KV, tg, userId);
+          await processQueue(env.LYRICS_KV, tg, userId, env);
           break;
         }
       }

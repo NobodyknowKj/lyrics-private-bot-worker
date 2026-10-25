@@ -1,6 +1,6 @@
 # lyrics-private-bot-worker
 
-Private Telegram song-lyrics bot as a Cloudflare Worker (JavaScript, no server, version 1.0.2-worker).
+Private Telegram song-lyrics bot as a Cloudflare Worker (JavaScript, no server, version 1.0.3-worker).
 
 A user sends a song in a private chat, the bot first asks with inline buttons whether they want a Telegraph page or a plain text message, then finds the lyrics, translates them line by line to Persian, and delivers them. If lyrics are not found, it offers pasting the lyrics manually or sending a lyrics-page link to extract from.
 
